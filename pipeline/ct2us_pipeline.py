@@ -8,7 +8,6 @@ ultrasound rendering, and point cloud generation process.
 import os
 import time
 from pathlib import PosixPath as pthlib
-from exceptiongroup import catch
 import tqdm
 from typing import Dict, List, Tuple, Union, Optional, Any
 
