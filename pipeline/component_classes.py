@@ -286,7 +286,10 @@ class TotalSegmentator(SegmentationMethod):
         
         # Import TotalSegmentator after setting license key
         import totalsegmentator.python_api as ts
+        ts.set_license_number(os.environ['TS_LICENSE_KEY'])
+
         self.ts = ts
+        
 
         # Configure segmentation parameters based on task
         self.segmentation_params = {
