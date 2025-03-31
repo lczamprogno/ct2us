@@ -134,11 +134,18 @@ class CT2USPipeline(nn.Module):
     def _create_default_components(self):
         """Create default components if not provided."""
         # Import the component classes
-        from pipeline.component_classes import (
-            Config, TotalSegmentator,
-            LotusUltrasoundRenderer,
-            PointCloudSampler
-        )
+        try:
+            from pipeline.component_classes import (
+                Config, TotalSegmentator,
+                LotusUltrasoundRenderer,
+                PointCloudSampler
+            )
+        except ImportError:
+            from ct2us.pipeline.component_classes import (
+                Config, TotalSegmentator,
+                LotusUltrasoundRenderer,
+                PointCloudSampler
+            )
         
         # Create configuration
         config = Config(
@@ -153,8 +160,10 @@ class CT2USPipeline(nn.Module):
                 from totalsegmentator.config import setup_nnunet, setup_totalseg
                 setup_nnunet()
                 setup_totalseg()
-                
-                from pipeline.initialize_predictors import initialize_predictors
+                try:
+                    from pipeline.initialize_predictors import initialize_predictors
+                except ImportError:
+                    from ct2us.pipeline.initialize_predictors import initialize_predictors
                 predictors = initialize_predictors(device=seg_device, folds=[0])
                 
                 self.segmentation = PredictorSegmentator(seg_device, predictors, config)

@@ -8,8 +8,12 @@ import os
 from typing import Literal, Dict, Type, Any
 
 # Import here to avoid circular imports
-import pipeline.component_classes as cc
-from pipeline.base_component import BaseComponent
+try:
+    import ct2us.pipeline.component_classes as cc
+    from ct2us.pipeline.base_component import BaseComponent
+except ImportError:
+    import pipeline.component_classes as cc
+    from pipeline.base_component import BaseComponent
 
 class PipelineConfig:
     """Configuration container for the entire CT2US pipeline."""
@@ -312,7 +316,10 @@ class CT2USPipelineFactory:
             os.makedirs(config.intermediate_dir, exist_ok=True)
         
         # Import here to avoid circular imports
-        from pipeline.ct2us_pipeline import CT2USPipeline
+        try:
+            from pipeline.ct2us_pipeline import CT2USPipeline
+        except ImportError:
+            from ct2us.pipeline.ct2us_pipeline import CT2USPipeline
 
         # Create segmentation component
         segmentator = config.instantiate_method('segmentation', config.method)

@@ -26,10 +26,14 @@ except ImportError:
 
 import scipy.ndimage
 
-from pipeline.ultrasound_rendering import UltrasoundRendering
-from pipeline.base_component import BaseComponent
-
-from pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
+try:
+    from pipeline.ultrasound_rendering import UltrasoundRendering
+    from pipeline.base_component import BaseComponent
+    from pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
+except ImportError:
+    from ct2us.pipeline.ultrasound_rendering import UltrasoundRendering
+    from ct2us.pipeline.base_component import BaseComponent
+    from ct2us.pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
 
 import trimesh as tri
 
@@ -767,7 +771,10 @@ class LotusUltrasoundRenderer(UltrasoundRenderingMethod):
         super().__init__(kwargs)
         
         # Import UltrasoundRendering class
-        from pipeline.ultrasound_rendering import UltrasoundRendering
+        try:
+            from pipeline.ultrasound_rendering import UltrasoundRendering
+        except ImportError:    
+            from ct2us.pipeline.ultrasound_rendering import UltrasoundRendering
         self.ultrasound_rendering = UltrasoundRendering(self.config.get('hparams', {}), default_param=True).to(self.device)
 
         resize_size = kwargs.get('resize_size', [380, 380])
@@ -801,7 +808,10 @@ class LotusUltrasoundRenderer(UltrasoundRenderingMethod):
         print("US SIMULATION STARTED")
 
         # Use UltrasoundRendering from pipeline like in the working code
-        from pipeline.ultrasound_rendering import UltrasoundRendering
+        try:
+            from pipeline.ultrasound_rendering import UltrasoundRendering
+        except ImportError:
+            from ct2us.pipeline.ultrasound_rendering import UltrasoundRendering
         
         hparams = {
             'debug': False,
@@ -936,7 +946,10 @@ class OptimizedLotusRenderer(UltrasoundRenderingMethod):
         
         # Import UltrasoundRendering class
         try:
-            from pipeline.ultrasound_rendering import UltrasoundRendering
+            try:
+                from pipeline.ultrasound_rendering import UltrasoundRendering
+            except ImportError:
+                from ct2us.pipeline.ultrasound_rendering import UltrasoundRendering
             self.ultrasound_rendering = UltrasoundRendering(self.config.get('hparams', {}), default_param=True).to(self.device)
         except ImportError as e:
             # Fallback to direct import from notebook (for backwards compatibility)
@@ -987,8 +1000,11 @@ class OptimizedLotusRenderer(UltrasoundRenderingMethod):
         pcd_data = []
         
         # For better slice selection support
-        from pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
-        
+        try:
+            from pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
+        except ImportError:
+            from ct2us.pipeline.torch_morphology import binary_closing, binary_dilation, binary_fill_holes
+
         for i, (seg, dest_path) in enumerate(zip(tqdm.tqdm(segs, desc="Rendering volumes"), dest_us)):
             # Handle CPU/GPU differences
             if hasattr(seg, 'get'):  # CuPy array
