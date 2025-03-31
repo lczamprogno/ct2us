@@ -13,7 +13,7 @@ Image generation process is very dependant on tissue attenuation, so specialized
 ---
 
 ## Current use:
-- ![example](../assets/Full%20Demo.gif)
+- ![example](https://drive.google.com/uc?export=view&id=16LZ1vCoQ48w1Xn8lBJ1ZrsRe0ngEgbjB)
   
 
 ## Further goals:
