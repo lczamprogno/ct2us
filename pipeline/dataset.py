@@ -4,6 +4,7 @@ Dataset handling for CT2US pipeline.
 This module contains dataset classes for loading and preprocessing CT volumes.
 """
 
+import os
 import glob
 from pathlib import PosixPath as pthlib
 import numpy as np
@@ -68,12 +69,41 @@ class CTDataset(Dataset):
             # TODO: Load paths from CSV file
             self.img_paths = []
         else:
-            self.img_paths = glob.glob(f"{str(self.img_dir)}/*.nii.gz")
+            # Get all nii.gz files in the directory
+            all_files = glob.glob(f"{str(self.img_dir)}/*.nii.gz")
+            
+            # Filter out any duplicate paths or files with "_label" suffix
+            # that might have been accidentally copied to the img_dir
+            filtered_files = [
+                pth for pth in all_files 
+                if not pth.endswith("_label.nii.gz") and not "_processed_" in pth
+            ]
+            
+            # Process the paths - maintain unique base names
+            base_names_seen = set()
+            unique_paths = []
+            
+            for pth in filtered_files:
+                # Get just the filename without directory
+                base_name = os.path.basename(pth)
+                
+                # If we've seen this base name before, skip it
+                if base_name in base_names_seen:
+                    print(f"Warning: Skipping duplicate file with same name: {base_name}")
+                    continue
+                    
+                # Add to seen set and unique paths
+                base_names_seen.add(base_name)
+                unique_paths.append(pth)
+            
+            # Create the path tuples for input, label, and US output
             self.img_paths = [(
                 pth,
                 pth.replace(".nii.gz", "_label.nii.gz").replace("/imgs/", "/labels/"),
                 pth.replace(".nii.gz", "_us").replace("/imgs/", "/us/")
-            ) for pth in self.img_paths]
+            ) for pth in unique_paths]
+            
+            print(f"Found {len(self.img_paths)} unique CT image(s) to process")
 
     def __len__(self):
         """Return the number of samples in the dataset."""

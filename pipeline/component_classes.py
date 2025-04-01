@@ -280,13 +280,14 @@ class TotalSegmentator(SegmentationMethod):
         # Set up device based on configuration
         kwargs = self._setup_device(kwargs)
         
+        # Set up license key for TotalSegmentator BEFORE parent initialization
+        # This ensures the license is available from the very beginning
+        self._setup_license_key(kwargs)
+        
         # Initialize parent class with updated kwargs
         super().__init__(kwargs)
         
-        # Set up license key for TotalSegmentator
-        self._setup_license_key(kwargs)
-        
-        # Import TotalSegmentator API
+        # Import TotalSegmentator API - will use the license set above
         self._import_totalsegmentator()
 
         # Configure segmentation parameters based on task
@@ -318,33 +319,56 @@ class TotalSegmentator(SegmentationMethod):
         # Store the original kwargs for other config values
         self._original_kwargs = kwargs.copy()
         
-        # Force CPU flag takes precedence if set - this is critical
+        # Create a function to completely disable CUDA/GPU access
+        def disable_cuda():
+            import os
+            # Set environment variables to prevent CUDA initialization in any library
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+            
+            # Explicitly disable JIT compilation with CUDA in PyTorch and other libraries
+            try:
+                torch.jit._disable_cu_compiler = True
+            except:
+                pass
+                
+            print("[Device] CUDA/GPU access completely disabled")
+            return 'cpu'  # Always return CPU as device
+        
+        # Force CPU flag takes precedence
         force_cpu = kwargs.get('force_cpu', False)
+        
+        # In these cases, we need to enforce CPU mode with all CUDA disabled:
+        # 1. force_cpu flag is set
+        # 2. We're in a CPU-only environment (CUDA init fails)
         if force_cpu:
             print("[Device] Force CPU mode enabled: Using CPU-only operations")
-            kwargs['device'] = 'cpu'
-            
-            # Completely disable CUDA for all operations
-            if torch.cuda.is_available():
-                print("[Device] CUDA is available but force_cpu=True completely disables it")
-                print("[Device] Setting CUDA_VISIBLE_DEVICES='' to prevent any GPU usage")
-                import os
-                os.environ['CUDA_VISIBLE_DEVICES'] = ''
-            
-        # Check CUDA availability - must respect force_cpu flag
-        cuda_available = torch.cuda.is_available() and not force_cpu
-        if 'device' in kwargs and kwargs['device'] == 'cuda' and not cuda_available:
-            if force_cpu:
-                print("[Device] CUDA requested but force_cpu=True overrides it")
+            kwargs['device'] = disable_cuda()
+        else:
+            # Check if we're in a CPU-only environment (e.g., Colab CPU runtime)
+            try:
+                cuda_available = torch.cuda.is_available()
+            except Exception as e:
+                print(f"[Device] Error checking CUDA availability: {e}")
+                print("[Device] This appears to be a CPU-only environment. Disabling all GPU access.")
+                kwargs['device'] = disable_cuda()
+                cuda_available = False
+                force_cpu = True  # Set force_cpu to ensure consistent behavior
             else:
-                print("[Device] CUDA requested but not available. Falling back to CPU.")
-            kwargs['device'] = 'cpu'
-        elif 'device' not in kwargs and cuda_available:
-            print("[Device] CUDA detected and will be used")
-            kwargs['device'] = 'cuda'
+                # Normal device selection logic
+                if cuda_available:
+                    if 'device' in kwargs and kwargs['device'] == 'cpu':
+                        print("[Device] CPU explicitly requested despite CUDA being available")
+                    else:
+                        print("[Device] CUDA detected and will be used")
+                        kwargs['device'] = 'cuda'
+                else:
+                    # CUDA not available - ensure CPU mode
+                    print("[Device] CUDA not available. Using CPU.")
+                    kwargs['device'] = 'cpu'
         
         # Store device information for later use
-        self.cuda_available = cuda_available
+        self.cuda_available = cuda_available if not force_cpu else False
         self.device_type = kwargs.get('device', 'cpu')
         
         # Convert 'cuda' to 'gpu' for TotalSegmentator API which only accepts 'gpu' or 'cpu'
@@ -362,8 +386,9 @@ class TotalSegmentator(SegmentationMethod):
         
         # Ensure force_cpu is preserved in kwargs for all parent and child classes
         kwargs['force_cpu'] = force_cpu
-                
-        pass
+        
+        # Add our device determination status as information
+        print(f"[Device] Final configuration: device={self.device_type}, force_cpu={force_cpu}")
         
         return kwargs
     
@@ -375,8 +400,13 @@ class TotalSegmentator(SegmentationMethod):
         """
         import os
         
+        # First check if environment variable is already set
+        if 'TS_LICENSE_KEY' in os.environ and os.environ['TS_LICENSE_KEY']:
+            print(f"TotalSegmentator license key already set in environment")
+            return
+        
         # Check if license key is provided in kwargs
-        if 'license_key' in kwargs:
+        if 'license_key' in kwargs and kwargs['license_key']:
             os.environ['TS_LICENSE_KEY'] = kwargs['license_key']
             print(f"Set TotalSegmentator license key from kwargs")
             return
@@ -391,14 +421,30 @@ class TotalSegmentator(SegmentationMethod):
             print(f"Note: No license key found in kwargs or globally: {e}")
     
     def _import_totalsegmentator(self):
-        """Import the TotalSegmentator API with proper error handling."""
+        """Import the TotalSegmentator API with proper error handling and license setting."""
         import os
         try:
             import totalsegmentator.python_api as ts
-            if 'TS_LICENSE_KEY' in os.environ:
+            
+            # Ensure license is set in the API
+            if 'TS_LICENSE_KEY' in os.environ and os.environ['TS_LICENSE_KEY']:
+                print(f"Setting license key in TotalSegmentator API")
                 ts.set_license_number(os.environ['TS_LICENSE_KEY'])
+                
+                # Double check by attempting to get the license from totalsegmentator
+                try:
+                    from totalsegmentator.config import get_license_number
+                    current_license = get_license_number()
+                    if current_license:
+                        print(f"Confirmed license is set in TotalSegmentator")
+                    else:
+                        print(f"Warning: License could not be confirmed in TotalSegmentator")
+                except Exception as e:
+                    print(f"Warning: Could not verify license: {e}")
+            else:
+                print(f"Warning: No TS_LICENSE_KEY found in environment")
+                
             self.ts = ts
-            pass
         except ImportError as e:
             raise
     
@@ -466,7 +512,6 @@ class TotalSegmentator(SegmentationMethod):
             SegmentationError: If segmentation fails
         """
         import os
-        import torch
         
         # Validate input images
         try:
@@ -480,24 +525,50 @@ class TotalSegmentator(SegmentationMethod):
         ret = []
         
         # Configure environment for segmentation
-        # Set environment variable for TotalSegmentator to use GPU/CPU
-        force_cpu = getattr(self, '_original_kwargs', {}).get('force_cpu', False)
+        # Make absolutely sure CUDA is disabled in CPU mode
+        force_cpu = getattr(self, '_original_kwargs', {}).get('force_cpu', False) 
         
-        if force_cpu:
-            # Always disable GPU completely for force_cpu mode
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''   # Disable GPU
+        # Set environment variables that control GPU visibility
+        if force_cpu or self.device_type == 'cpu':
+            # Comprehensive approach to disable CUDA/GPU
+            gpu_env_vars = {
+                'CUDA_VISIBLE_DEVICES': '',
+                'CUDA_DEVICE_ORDER': 'PCI_BUS_ID',
+                'PYTORCH_CUDA_ALLOC_CONF': 'max_split_size_mb:32',
+                'PYTORCH_NO_CUDA_MEMORY_CACHING': '1',
+                'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
+                'TF_GPU_ALLOCATOR': '',
+                'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.0'
+            }
+            
+            # Apply all GPU-disabling environment variables
+            for var, value in gpu_env_vars.items():
+                os.environ[var] = value
+                
+            print(f"[Segment] Set comprehensive GPU-disabling environment for CPU mode")
         elif self.cuda_available and self.device_type == 'cuda':
             os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
+            print(f"[Segment] Using GPU for segmentation (CUDA_VISIBLE_DEVICES=0)")
         else:
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''   # Disable GPU
-            # Show message based on whether CPU is forced or required
-            if torch.cuda.is_available() and not self.cuda_available:
-                pass
-            else:
-                pass
+            # Fallback - disable GPU
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            print(f"[Segment] Using CPU for segmentation (CUDA_VISIBLE_DEVICES='')")
         
         # Ensure license key is set (double-check)
         self._setup_license_key({})
+        
+        # Re-import totalsegmentator API to ensure license is properly set
+        # This import will respect the environment variables we just set
+        self._import_totalsegmentator()
+        
+        # Explicitly verify device setting for TotalSegmentator
+        print(f"[Segment] TotalSegmentator device type: {self.ts_device_type}")
+        
+        # Override device selection for GPU-related errors in CPU mode
+        if force_cpu or self.device_type == 'cpu':
+            # Make triply sure we're using CPU for segmentation
+            self.ts_device_type = 'cpu'
+            print(f"[Segment] Enforcing CPU mode for TotalSegmentator")
         
         # Clear memory before starting segmentation process
         self._manage_memory(clear_cache=True)
@@ -508,11 +579,24 @@ class TotalSegmentator(SegmentationMethod):
             try:
                 # Prepare segmentation parameters
                 segmentation_params = {
-                    "device": self.ts_device_type,
                     "input": img,
                     "task": task,
                     "nr_thr_resamp": resamp_thr
                 }
+                
+                # For CPU mode, override device parameter and ensure other GPU-specific settings are disabled
+                if self.device_type == 'cpu' or getattr(self, '_original_kwargs', {}).get('force_cpu', False):
+                    segmentation_params["device"] = "cpu"
+                    
+                    # Override threads to be CPU-friendly
+                    safe_cpu_threads = min(os.cpu_count() or 2, 4)  # Limit to 4 threads max or CPU count
+                    segmentation_params["nr_thr_resamp"] = safe_cpu_threads
+                    
+                    # Ensure fast mode is set for CPU if we're in CPU mode to improve performance
+                    print(f"[Segment] Using CPU mode with {safe_cpu_threads} threads for resampling")
+                else:
+                    # For GPU mode, use the previously determined device type
+                    segmentation_params["device"] = self.ts_device_type
                 
                 # Only apply fast mode to 'total' task
                 if task == 'total' and self.segmentation_params.get("fast", False):
@@ -536,6 +620,9 @@ class TotalSegmentator(SegmentationMethod):
                         segmentation_params['roi'] = True
                         print(f"TotalSegmentator: Using ROI for {task} segmentation task")
                 
+                # Final verification of segmentation parameters
+                print(f"[Segment] Executing totalsegmentator with device={segmentation_params.get('device', 'cpu')}")
+                
                 # Create segmentation with specified parameters (only called once)
                 segmentation = self.ts.totalsegmentator(**segmentation_params)
                 
@@ -549,8 +636,52 @@ class TotalSegmentator(SegmentationMethod):
                 ret.append(seg_array)
                 
             except Exception as e:
-                # Print error for debugging
-                print(f"Error in {self.__class__.__name__} segmentation: {e}")
+                # Check if this looks like a CUDA/GPU-related error
+                error_str = str(e).lower()
+                cuda_related = any(term in error_str for term in [
+                    'cuda', 'gpu', 'device', 'memory', 'cudnn', 'nvidia', 'driver', 'torch',
+                    'out of memory', 'allocation', 'graphics', 'failed to initialize'
+                ])
+                
+                if cuda_related:
+                    # Enhanced error message for CUDA-related errors
+                    print(f"CUDA/GPU ERROR in {self.__class__.__name__} segmentation: {e}")
+                    print(f"This appears to be a CUDA-related error. Actions taken:")
+                    
+                    # Set force_cpu permanently for this session and enforce stricter GPU disabling
+                    try:
+                        # Apply more aggressive GPU disabling
+                        import os
+                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+                        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+                        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
+                        os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
+                        print("1. Set all CUDA/GPU environment variables to disable GPU access")
+                        
+                        # Force CPU mode for future operations
+                        if hasattr(self, '_original_kwargs'):
+                            self._original_kwargs['force_cpu'] = True
+                        self.device_type = 'cpu'
+                        self.ts_device_type = 'cpu'
+                        self.cuda_available = False
+                        print("2. Permanently enforced CPU mode for all future operations")
+                        
+                        # Try to modify PyTorch CUDA settings
+                        import torch
+                        if hasattr(torch, 'cuda'):
+                            if hasattr(torch.cuda, 'set_device'):
+                                try:
+                                    torch.cuda.set_device('cpu')
+                                except:
+                                    pass
+                            print("3. Attempted to reset PyTorch CUDA settings")
+                    except Exception as inner_e:
+                        print(f"Error during recovery actions: {inner_e}")
+                    
+                    print("NOTE: Consider restarting this session and using CPU mode explicitly with the 'Force CPU Mode' option enabled.")
+                else:
+                    # Regular error handling for non-CUDA errors
+                    print(f"Error in {self.__class__.__name__} segmentation: {e}")
                 
                 # Return empty segmentation of the right shape if there's an error
                 if len(ret) > 0:
@@ -561,8 +692,23 @@ class TotalSegmentator(SegmentationMethod):
                     img_shape = img.shape if hasattr(img, 'shape') else (256, 256, 256)
                     ret.append(np.zeros(img_shape, dtype=np.uint8))
             
-            # Clean up memory after each image
-            self._manage_memory()
+            # Clean up memory after each image - more aggressively in case of errors
+            try:
+                self._manage_memory(clear_cache=True)
+                
+                # Force Python garbage collection
+                import gc
+                gc.collect()
+                
+                # If PyTorch is available, try to clear its caches too
+                try:
+                    import torch
+                    if hasattr(torch, 'cuda') and hasattr(torch.cuda, 'empty_cache'):
+                        torch.cuda.empty_cache()
+                except:
+                    pass
+            except Exception as e:
+                print(f"Warning: Error during memory cleanup: {e}")
             
         return ret
     
