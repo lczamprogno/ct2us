@@ -39,7 +39,10 @@ class CT2USPipeline(nn.Module):
                  us_renderer=None,
                  pcd_sampler=None,
                  save_intermediates: bool = False,
-                 intermediate_dir: str = './intermediates'):
+                 intermediate_dir: str = './intermediates',
+                 force_cpu: bool = False,
+                 method: str = 'standard',
+                 us_method: str = 'lotus_new'):
         """Initialize the CT2US pipeline.
         
         Args:
@@ -49,21 +52,42 @@ class CT2USPipeline(nn.Module):
             pcd_sampler: Optional point cloud sampling component
             save_intermediates: Whether to save intermediate results
             intermediate_dir: Directory to save intermediate results
+            force_cpu: Force CPU usage even if CUDA is available
+            method: Segmentation method ('standard', 'predictor', or 'mp_predictor')
+            us_method: Ultrasound rendering method ('lotus_new' or 'new')
         """
         super(CT2USPipeline, self).__init__()
         
+        # Set device based on force_cpu flag
+        self.force_cpu = force_cpu
+        if force_cpu:
+            device_str = 'cpu'
+            
+            # Disable CUDA visibility if forcing CPU
+            if torch.cuda.is_available():
+                import os
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            
         self.device = device_str
         self.save_intermediates = save_intermediates
         self.intermediate_dir = intermediate_dir
+        
+        # Set segmentation and US rendering methods
+        self.method = method
+        self.us_method = us_method
         
         # Create intermediate directory if needed
         if save_intermediates:
             os.makedirs(intermediate_dir, exist_ok=True)
         
         # Setup computational module based on device
-        if device_str != 'cpu' and torch.cuda.is_available():
-            self.m = cp
-            self.ops = cusci
+        if device_str != 'cpu' and torch.cuda.is_available() and not force_cpu:
+            try:
+                self.m = cp
+                self.ops = cusci
+            except (ImportError, NameError):
+                self.m = np
+                self.ops = scipy.ndimage
         else:
             self.m = np
             self.ops = scipy.ndimage
@@ -137,14 +161,28 @@ class CT2USPipeline(nn.Module):
             from pipeline.component_classes import (
                 Config, TotalSegmentator,
                 LotusUltrasoundRenderer,
-                PointCloudSampler
+                PointCloudSampler,
+                PredictorSegmentator
             )
+            # Try to import the MP segmentator
+            try:
+                from pipeline.mp_segmentator import MPPredictorSegmentator
+                has_mp_segmentator = True
+            except ImportError:
+                has_mp_segmentator = False
         except ImportError:
             from ct2us.pipeline.component_classes import (
                 Config, TotalSegmentator,
                 LotusUltrasoundRenderer,
-                PointCloudSampler
+                PointCloudSampler,
+                PredictorSegmentator
             )
+            # Try to import the MP segmentator
+            try:
+                from ct2us.pipeline.mp_segmentator import MPPredictorSegmentator
+                has_mp_segmentator = True
+            except ImportError:
+                has_mp_segmentator = False
         
         # Create configuration
         config = Config(
@@ -154,7 +192,7 @@ class CT2USPipeline(nn.Module):
         
         seg_device = self._determine_segmentation_device()
 
-        if self.method == 'predictor':
+        if self.method == 'predictor' or self.method == 'mp_predictor':
             try:
                 from totalsegmentator.config import setup_nnunet, setup_totalseg
                 setup_nnunet()
@@ -163,14 +201,36 @@ class CT2USPipeline(nn.Module):
                     from pipeline.initialize_predictors import initialize_predictors
                 except ImportError:
                     from ct2us.pipeline.initialize_predictors import initialize_predictors
+                
                 predictors = initialize_predictors(device=seg_device, folds=[0])
                 
-                self.segmentation = PredictorSegmentator(seg_device, predictors, config)
-            except ImportError:
-                print("Warning: Predictor method requested but TotalSegmentator not available. Using standard segmentation.")
-                self.segmentation = TotalSegmentator(seg_device, config)
+                if self.method == 'mp_predictor' and has_mp_segmentator:
+                    # Calculate number of worker processes based on available resources
+                    num_cpu_workers = max(1, os.cpu_count() // 2)  # Use half available CPU cores
+                    num_gpu_workers = 1 if not self.force_cpu and torch.cuda.is_available() else 0
+                    
+                    # Create kwargs with all necessary parameters
+                    mp_kwargs = {
+                        'device': seg_device,
+                        'force_cpu': self.force_cpu,
+                        'num_cpu_workers': num_cpu_workers,
+                        'num_gpu_workers': num_gpu_workers,
+                        'save_intermediates': self.save_intermediates,
+                        'intermediate_dir': self.intermediate_dir
+                    }
+                    
+                    # Create multiprocessing segmentator
+                    self.segmentation = MPPredictorSegmentator(mp_kwargs, predictors)
+                    print(f"Using MultiProcessing PredictorSegmentator with {num_gpu_workers} GPU workers and {num_cpu_workers} CPU workers")
+                else:
+                    # Create standard predictor segmentator
+                    self.segmentation = PredictorSegmentator({'device': seg_device, 'force_cpu': self.force_cpu}, predictors)
+                    print(f"Using standard PredictorSegmentator on {seg_device}")
+            except ImportError as e:
+                print(f"Warning: Predictor method requested but TotalSegmentator not available ({e}). Using standard segmentation.")
+                self.segmentation = TotalSegmentator({'device': seg_device, 'force_cpu': self.force_cpu})
         else:
-            self.segmentation = TotalSegmentator(seg_device, config)
+            self.segmentation = TotalSegmentator({'device': seg_device, 'force_cpu': self.force_cpu})
             print(f"Note: Using {seg_device} for TotalSegmentator based on available resources")
     
         # Create US rendering component
@@ -277,17 +337,35 @@ class CT2USPipeline(nn.Module):
                 self._save_intermediate(f"base", base, i)
                 self._save_intermediate(f"initial_labels", f_labels[i], i)
     
-        print("SEGMENTATING:")
-        
         # Run segmentation for each task
         segmentation_start = time.time()
         segmentation_results = []
         tasks = self.segmentation.tasks()
-        for idx in tqdm.tqdm(range(len(tasks)), desc= "Segmentating batch" if len(tasks) > 1 else "Segmentating"):
-            result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
-
+        for idx in tqdm.tqdm(range(len(tasks)), desc="Segmenting"):
+            # Only apply fast mode for 'total' task, never for tissue_types or body
+            if tasks[idx] != 'total' and hasattr(self.segmentation, 'segmentation_params'):
+                # Store original fast setting
+                original_fast = self.segmentation.segmentation_params.get('fast', False)
+                
+                # If we're using fast mode globally but this isn't a 'total' task
+                if original_fast:
+                    # Force fast mode off for non-total tasks
+                    self.segmentation.segmentation_params['fast'] = False
+                    print(f"*** Disabling fast mode for '{tasks[idx]}' segmentation regardless of global setting ***")
+                    
+                    # Run segmentation with fast mode disabled
+                    result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
+                    
+                    # Restore original fast setting
+                    self.segmentation.segmentation_params['fast'] = original_fast
+                else:
+                    # Fast mode already off, use normal settings
+                    result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
+            else:
+                # For 'total' task, use whatever settings are configured
+                result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
+                
             segmentation_results.append(result)
-            print(f"SEG DONE: {tasks[idx]}")
         timing['segmentation_time'] = time.time() - segmentation_start
         
         # Assemble segmentations into final label maps
@@ -392,10 +470,6 @@ class CT2USPipeline(nn.Module):
         
         # Calculate total execution time
         timing['total_time'] = time.time() - timing['start_time']
-        print(f"PIPELINE EXECUTION TIMES:")
-        print(f"  Segmentation: {timing['segmentation_time']:.2f}s")
-        print(f"  Assembly: {timing['assembly_time']:.2f}s")
-        print(f"  US Rendering: {timing['us_rendering_time']:.2f}s")
-        print(f"  Total: {timing['total_time']:.2f}s")
+        print(f"Times: Seg={timing['segmentation_time']:.1f}s, Assembly={timing['assembly_time']:.1f}s, Render={timing['us_rendering_time']:.1f}s, Total={timing['total_time']:.1f}s")
         
         return [str(pthlib(d).name) for d in dest_label], us_imgs, warped_labels, preview_labels, timing

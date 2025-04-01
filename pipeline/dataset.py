@@ -20,7 +20,7 @@ except ImportError:
 class CTDataset(Dataset):
     # Dataset class for loading CT volumes from directories.
     
-    def __init__(self, img_dir: str, method: str = "old", annotations_file: str = None, resample: float = 1.5):
+    def __init__(self, img_dir: str, method: str = "old", annotations_file: str = None, resample: float = 1.5, force_cpu: bool = False):
         """
         Initialize the dataset.
         
@@ -29,16 +29,21 @@ class CTDataset(Dataset):
             method: Pipeline method to use ('old', 'new', 'predictor')
             annotations_file: Optional path to annotations file (CSV)
             resample: Resampling factor
+            force_cpu: Force CPU usage even if CUDA is available
         """
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        # If force_cpu is True, always use CPU regardless of CUDA availability
+        # Set device based on force_cpu flag
+        self.device = torch.device("cpu") if force_cpu else (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+            
         self.method = method
         
         # Set up array library based on device
-        if self.device.type == "cuda" and torch.cuda.is_available():
+        if self.device.type == "cuda":
             try:
                 self.m = cp
             except NameError:
-                print("Warning: CuPy not available. Using NumPy instead.")
                 self.m = np
         else:
             self.m = np

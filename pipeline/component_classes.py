@@ -7,6 +7,7 @@ and point cloud sampling, which can be plugged into the CT2US pipeline.
 
 from abc import ABC, abstractmethod, abstractproperty
 import os
+import time
 from pathlib import PosixPath as pthlib
 import tqdm
 from typing import Dict, List, Tuple, Union, Any
@@ -107,7 +108,10 @@ class SegmentationMethod(BaseComponent):
             device_str = kwargs
             kwargs = {'device': device_str}
             
-        super().__init__(kwargs.get('device', 'cpu'))
+        # Extract force_cpu parameter to pass to parent class
+        force_cpu = kwargs.get('force_cpu', False)
+            
+        super().__init__(kwargs.get('device', 'cpu'), force_cpu=force_cpu)
 
         self.config['use_roi'] = kwargs.get('use_roi', False)
         self.config['resamp_thr'] = kwargs.get('resamp_thr', 4)
@@ -238,6 +242,18 @@ class SegmentationMethod(BaseComponent):
         pass
 
 
+class SegmentationError(Exception):
+    """Base exception for segmentation errors."""
+    pass
+    
+class InputValidationError(SegmentationError):
+    """Exception for input validation failures."""
+    pass
+    
+class GPUMemoryError(SegmentationError):
+    """Exception for GPU memory issues."""
+    pass
+
 class TotalSegmentator(SegmentationMethod):
     """Segmentation method using TotalSegmentator."""
     
@@ -247,6 +263,10 @@ class TotalSegmentator(SegmentationMethod):
         Args:
             kwargs: Dictionary containing configuration parameters including:
                 device: The device to use for computation ('cuda' or 'cpu')
+                use_roi: Whether to use region of interest (ROI) feature
+                fast: Whether to use fast mode (3mm resolution)
+                force_cpu: Force CPU usage even if CUDA is available (for testing)
+                license_key: TotalSegmentator license key
                 Other configuration parameters
         """
         # Ensure kwargs is a dictionary
@@ -256,40 +276,18 @@ class TotalSegmentator(SegmentationMethod):
             # Handle case where a string is passed instead of a dict
             device_str = kwargs
             kwargs = {'device': device_str}
-            
-        # Check CUDA availability and set device correctly
-        import torch
-        if 'device' in kwargs and kwargs['device'] == 'cuda' and not torch.cuda.is_available():
-            print("CUDA requested but not available. Falling back to CPU.")
-            kwargs['device'] = 'cpu'
-        elif 'device' not in kwargs and torch.cuda.is_available():
-            print("CUDA detected and will be used.")
-            kwargs['device'] = 'cuda'
         
+        # Set up device based on configuration
+        kwargs = self._setup_device(kwargs)
+        
+        # Initialize parent class with updated kwargs
         super().__init__(kwargs)
         
-        # Ensure license key is set if provided
-        if 'license_key' in kwargs:
-            import os
-            os.environ['TS_LICENSE_KEY'] = kwargs['license_key']
-            print(f"Set TotalSegmentator license key from kwargs")
-        else:
-            # Check if license key is already defined globally
-            try:
-                import __main__
-                if hasattr(__main__, 'license') and __main__.license:
-                    import os
-                    os.environ['TS_LICENSE_KEY'] = __main__.license
-                    print(f"Set TotalSegmentator license key from global variable")
-            except Exception as e:
-                print(f"Note: No license key found in kwargs or globally: {e}")
+        # Set up license key for TotalSegmentator
+        self._setup_license_key(kwargs)
         
-        # Import TotalSegmentator after setting license key
-        import totalsegmentator.python_api as ts
-        ts.set_license_number(os.environ['TS_LICENSE_KEY'])
-
-        self.ts = ts
-        
+        # Import TotalSegmentator API
+        self._import_totalsegmentator()
 
         # Configure segmentation parameters based on task
         self.segmentation_params = {
@@ -298,6 +296,154 @@ class TotalSegmentator(SegmentationMethod):
             "verbose": kwargs.get('verbose', True)  # Add verbose output for debugging
         }
         
+        # Set ROI configuration
+        self.config['use_roi'] = kwargs.get('use_roi', False)
+        if self.config['use_roi']:
+            print("*** ROI feature enabled for TotalSegmentator ***")
+        
+        # Clean up memory after initialization
+        self._manage_memory()
+    
+    def _setup_device(self, kwargs):
+        """Set up the device for computation based on configuration and system capabilities.
+        
+        Args:
+            kwargs: Configuration dictionary
+            
+        Returns:
+            Updated kwargs dictionary with correct device settings
+        """
+        import torch
+        
+        # Store the original kwargs for other config values
+        self._original_kwargs = kwargs.copy()
+        
+        # Force CPU flag takes precedence if set - this is critical
+        force_cpu = kwargs.get('force_cpu', False)
+        if force_cpu:
+            print("[Device] Force CPU mode enabled: Using CPU-only operations")
+            kwargs['device'] = 'cpu'
+            
+            # Completely disable CUDA for all operations
+            if torch.cuda.is_available():
+                print("[Device] CUDA is available but force_cpu=True completely disables it")
+                print("[Device] Setting CUDA_VISIBLE_DEVICES='' to prevent any GPU usage")
+                import os
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            
+        # Check CUDA availability - must respect force_cpu flag
+        cuda_available = torch.cuda.is_available() and not force_cpu
+        if 'device' in kwargs and kwargs['device'] == 'cuda' and not cuda_available:
+            if force_cpu:
+                print("[Device] CUDA requested but force_cpu=True overrides it")
+            else:
+                print("[Device] CUDA requested but not available. Falling back to CPU.")
+            kwargs['device'] = 'cpu'
+        elif 'device' not in kwargs and cuda_available:
+            print("[Device] CUDA detected and will be used")
+            kwargs['device'] = 'cuda'
+        
+        # Store device information for later use
+        self.cuda_available = cuda_available
+        self.device_type = kwargs.get('device', 'cpu')
+        
+        # Convert 'cuda' to 'gpu' for TotalSegmentator API which only accepts 'gpu' or 'cpu'
+        self.ts_device_type = "gpu" if self.device_type == "cuda" else self.device_type
+        
+        # For force_cpu mode, ensure ts_device_type is always 'cpu'
+        if force_cpu:
+            self.ts_device_type = "cpu"
+        
+        # Preserve any other config settings (like ROI, etc.)
+        for key, value in self._original_kwargs.items():
+            if key != 'device' and key != 'force_cpu':
+                # Keep other configuration values
+                kwargs[key] = value
+        
+        # Ensure force_cpu is preserved in kwargs for all parent and child classes
+        kwargs['force_cpu'] = force_cpu
+                
+        pass
+        
+        return kwargs
+    
+    def _setup_license_key(self, kwargs):
+        """Set up the TotalSegmentator license key from kwargs or global variable.
+        
+        Args:
+            kwargs: Configuration dictionary
+        """
+        import os
+        
+        # Check if license key is provided in kwargs
+        if 'license_key' in kwargs:
+            os.environ['TS_LICENSE_KEY'] = kwargs['license_key']
+            print(f"Set TotalSegmentator license key from kwargs")
+            return
+        
+        # Check if license key is defined globally
+        try:
+            import __main__
+            if hasattr(__main__, 'license') and __main__.license:
+                os.environ['TS_LICENSE_KEY'] = __main__.license
+                print(f"Set TotalSegmentator license key from global variable")
+        except Exception as e:
+            print(f"Note: No license key found in kwargs or globally: {e}")
+    
+    def _import_totalsegmentator(self):
+        """Import the TotalSegmentator API with proper error handling."""
+        import os
+        try:
+            import totalsegmentator.python_api as ts
+            if 'TS_LICENSE_KEY' in os.environ:
+                ts.set_license_number(os.environ['TS_LICENSE_KEY'])
+            self.ts = ts
+            pass
+        except ImportError as e:
+            raise
+    
+    def _manage_memory(self, clear_cache=True):
+        """Centralized memory management.
+        
+        Args:
+            clear_cache: Whether to clear CUDA cache (default: True)
+        """
+        import gc
+        gc.collect()
+        
+        if torch.cuda.is_available() and clear_cache:
+            try:
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                
+                # Report memory status if verbose
+                if self.segmentation_params.get("verbose", True):
+                    # Skip memory reporting
+                    pass
+            except Exception:
+                pass
+        
+        return
+    
+    def _validate_input(self, imgs):
+        """Validate input images before processing.
+        
+        Args:
+            imgs: List of input images
+            
+        Raises:
+            InputValidationError: If input validation fails
+        """
+        if not imgs:
+            raise InputValidationError("Empty input image list")
+        
+        for i, img in enumerate(imgs):
+            if img is None:
+                raise InputValidationError(f"Image at index {i} is None")
+            
+            # Check if it's a proper nifti or numpy array
+            if not (hasattr(img, 'shape') or hasattr(img, 'dataobj')):
+                raise InputValidationError(f"Image at index {i} has invalid type: {type(img)}")
     
     def segment(self, 
                 imgs: List[Union[nifti1.Nifti1Image, np.ndarray]],
@@ -314,56 +460,84 @@ class TotalSegmentator(SegmentationMethod):
             
         Returns:
             List of segmentation results
+            
+        Raises:
+            InputValidationError: If input validation fails
+            SegmentationError: If segmentation fails
         """
-        # Store the mapped task for use in segmentation
-        ret = []
-        
-        # Set license key from environment if available
         import os
         import torch
-        import gc
         
-        # Double-check CUDA availability and set device properly
-        cuda_available = torch.cuda.is_available()
-        print(f"CUDA detected: {cuda_available}")
+        # Validate input images
+        try:
+            self._validate_input(imgs)
+        except InputValidationError as e:
+            print(f"Input validation error: {e}")
+            # Create and return a default empty segmentation
+            return [np.zeros((256, 256, 256), dtype=np.uint8) for _ in range(len(imgs))]
         
+        # Prepare return list
+        ret = []
+        
+        # Configure environment for segmentation
         # Set environment variable for TotalSegmentator to use GPU/CPU
-        if cuda_available and str(self.device).startswith('cuda'):
+        force_cpu = getattr(self, '_original_kwargs', {}).get('force_cpu', False)
+        
+        if force_cpu:
+            # Always disable GPU completely for force_cpu mode
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''   # Disable GPU
+        elif self.cuda_available and self.device_type == 'cuda':
             os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use first GPU
         else:
             os.environ['CUDA_VISIBLE_DEVICES'] = ''   # Disable GPU
+            # Show message based on whether CPU is forced or required
+            if torch.cuda.is_available() and not self.cuda_available:
+                pass
+            else:
+                pass
         
-        # Ensure license key is set
-        try:
-            from __main__ import license
-            if license and not os.environ.get('TS_LICENSE_KEY'):
-                os.environ['TS_LICENSE_KEY'] = license
-                print(f"Set TotalSegmentator license key from global variable")
-        except Exception as e:
-            print(f"Note: No license key found globally: {e}")
+        # Ensure license key is set (double-check)
+        self._setup_license_key({})
         
-        # Clear CUDA cache before starting to ensure maximum available memory
-        try:
-            if cuda_available:
-                torch.cuda.empty_cache()
-                gc.collect()
-                print("Cleared CUDA cache")
-        except Exception as e:
-            print(f"Error clearing CUDA cache: {e}")
+        # Clear memory before starting segmentation process
+        self._manage_memory(clear_cache=True)
         
         # Process each image
         for img in imgs:
-            print(f"Processing image with TotalSegmentator (on device: {self.device}) for task: {task}...")
+            print(f"Processing image with TotalSegmentator for task: {task}...")
             try:
-                # Create segmentation with specified task
-                segmentation = self.ts.totalsegmentator(
-                    input=img,
-                    task=task,
-                    nr_thr_resamp=resamp_thr,
-                    fast=self.segmentation_params.get("fast", False)
-                )
-
-                print(f"Segmentation completed successfully")
+                # Prepare segmentation parameters
+                segmentation_params = {
+                    "device": self.ts_device_type,
+                    "input": img,
+                    "task": task,
+                    "nr_thr_resamp": resamp_thr
+                }
+                
+                # Only apply fast mode to 'total' task
+                if task == 'total' and self.segmentation_params.get("fast", False):
+                    segmentation_params["fast"] = True
+                    print(f"TotalSegmentator: Using FAST mode (3mm) for {task} segmentation task")
+                elif self.segmentation_params.get("fast", False):
+                    # For other tasks, log that we're not using fast mode despite it being enabled globally
+                    print(f"TotalSegmentator: NOT using FAST mode for {task} segmentation task despite global fast setting")
+                
+                # Add ROI parameters if enabled
+                if self.config.get('use_roi', False):
+                    # Check if the TotalSegmentator API supports ROI parameters
+                    import inspect
+                    ts_params = inspect.signature(self.ts.totalsegmentator).parameters
+                    
+                    # Use ROI parameter if available in the API
+                    if 'roi_subset' in ts_params:
+                        segmentation_params['roi_subset'] = True
+                        print(f"TotalSegmentator: Using ROI subset for {task} segmentation task")
+                    elif 'roi' in ts_params:
+                        segmentation_params['roi'] = True
+                        print(f"TotalSegmentator: Using ROI for {task} segmentation task")
+                
+                # Create segmentation with specified parameters (only called once)
+                segmentation = self.ts.totalsegmentator(**segmentation_params)
                 
                 # Convert the segmentation result to numpy array
                 if hasattr(segmentation, 'dataobj'):
@@ -371,14 +545,13 @@ class TotalSegmentator(SegmentationMethod):
                 else:
                     seg_array = np.asarray(segmentation, dtype=np.uint8)
                 
-                print(f"Converted to array with shape: {seg_array.shape}")
-                
                 # Add result to return list
                 ret.append(seg_array)
-                print(f"Completed segmentation for task: {task}")
                 
             except Exception as e:
-                print(f"Error in segmentation for task {task}: {e}")
+                # Print error for debugging
+                print(f"Error in {self.__class__.__name__} segmentation: {e}")
+                
                 # Return empty segmentation of the right shape if there's an error
                 if len(ret) > 0:
                     # Use same shape as previous successful segmentation
@@ -387,17 +560,51 @@ class TotalSegmentator(SegmentationMethod):
                     # Create empty segmentation with a default shape
                     img_shape = img.shape if hasattr(img, 'shape') else (256, 256, 256)
                     ret.append(np.zeros(img_shape, dtype=np.uint8))
-                print(f"Created empty segmentation due to error")
             
-            # Clear memory after each image
-            try:
-                gc.collect()
-                if cuda_available:
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Error clearing memory: {e}")
+            # Clean up memory after each image
+            self._manage_memory()
             
         return ret
+    
+    def _setup_array_backend(self):
+        """Set up the array backend for processing based on current device.
+        
+        This method configures whether to use NumPy or CuPy based on device availability.
+        """
+        import numpy as np
+        import torch
+        
+        try:
+            import cupy as cp
+            has_cupy = True
+        except ImportError:
+            has_cupy = False
+            
+        # Determine device type
+        device_type = self.device.type if hasattr(self.device, 'type') else str(self.device)
+        cuda_available = torch.cuda.is_available()
+        
+        # Check if force_cpu is active
+        force_cpu = hasattr(self, 'cuda_available') and torch.cuda.is_available() and not self.cuda_available
+        
+        # Configure array backend based on device and availability
+        if has_cupy and device_type == 'cuda' and cuda_available and not force_cpu:
+            self.m = cp
+            import cupyx.scipy.ndimage as cusci
+            self.ops = cusci
+            print("[Arrays] Using CuPy/cuSciPy (GPU accelerated)")
+        else:
+            self.m = np
+            import scipy.ndimage
+            self.ops = scipy.ndimage
+            if force_cpu:
+                print("[Arrays] Force CPU mode: Using NumPy/SciPy despite CUDA availability")
+            elif device_type == 'cpu' and has_cupy and cuda_available:
+                print("[Arrays] Using NumPy/SciPy (CPU explicitly selected)")
+            else:
+                print("[Arrays] Using NumPy/SciPy (CPU-only)")
+            
+        return self.m, self.ops
     
     def assemble(self,
                 task: str,
@@ -415,95 +622,146 @@ class TotalSegmentator(SegmentationMethod):
         Returns:
             Updated segmentation results
         """
-        print(f"ASSEMBLY STARTED: {task}")
+        # Set up array backend (NumPy or CuPy) based on device
+        if not hasattr(self, 'm') or self.m is None:
+            self._setup_array_backend()
         
-        # Verify we have segmentation results
-        if not segs:
-            print(f"Warning: No segmentation results to assemble for task '{task}'")
+        # Validate input
+        if not segs or len(segs) == 0:
             return prev
+            
+        # Skip validation to reduce logging
         
-        # Print info about segmentation results
-        print(f"Number of segmentation results: {len(segs)}")
-        for i, seg in enumerate(segs):
-            if seg is not None:
-                print(f"Seg {i} shape: {seg.shape}, dtype: {seg.dtype}, unique values: {np.unique(seg)[:10]}")
+        # Process based on task type
+        try:
+            if task == 'total':
+                self._assemble_total(segs, prev)
+            elif task == 'tissue_types':
+                self._assemble_tissue_types(segs, prev)
+            elif task == 'body':
+                self._assemble_body(segs, bases, prev)
             else:
-                print(f"Seg {i} is None")
-        
-        # Simplified implementation directly from the working code example
-        if task == 'total':
-            for j in range(len(segs)):
-                if segs[j] is None or segs[j].size == 0:
-                    print(f"Skipping empty segmentation result at index {j}")
-                    continue
-                
-                # Process each label group according to total_lmap
-                for i in range(len(self.config['tmap'])):
-                    if len(self.config['tmap'][i]) > 0:  # if there are any keys for this value
-                        try:
-                            # This exact line is from the working code
-                            a = self.m.where(self.m.isin(self.m.asarray(segs[j], dtype=self.m.uint8), 
-                                                       self.m.array(self.config['tmap'][i])), 
-                                           self.m.uint8(i), self.m.uint8(0))
-                            prev[j] += a
-                        except Exception as e:
-                            print(f"Error processing class {i}: {e}")
-        
-        elif task == 'tissue_types':
-            for j in range(len(segs)):
-                if segs[j] is None or segs[j].size == 0:
-                    print(f"Skipping empty segmentation result at index {j}")
-                    continue
-                
-                # This matches the working code
-                t = self.m.asarray(segs[j])
-                prev[j][t == 1] = self.m.uint8(self.config['name2label']["body"]["fat"])
-                prev[j][t == 2] = self.m.uint8(self.config['name2label']["body"]["fat"])
-        
-        elif task == 'body':
-            for j in range(len(segs)):
-                if segs[j] is None or segs[j].size == 0:
-                    print(f"Skipping empty segmentation result at index {j}")
-                    continue
-                
-                try:
-                    # Direct implementation from the working code
-                    t = self.m.asarray(segs[j])
-                    
-                    # Values directly from the working code
-                    body = self.ops.binary_dilation(t == 1, iterations=1).astype(self.m.uint8)
-                    body_inner = self.ops.binary_erosion(t, iterations=3, brute_force=True).astype(self.m.uint8)
-                    skin = body - body_inner
-                    
-                    # Range values directly from the working code
-                    density_mask = (bases[j] > -200) & (bases[j] < 250)
-                    skin[~density_mask] = 0
-                    
-                    # Process connected components to remove small blobs
-                    mask, _ = self.ops.label(skin)
-                    counts = self.m.bincount(mask.flatten())
-                    
-                    # Values directly from the working code
-                    if len(counts) > 1:
-                        remove = self.m.where((counts <= 10) | (counts > 30), True, False)
-                        remove_idx = self.m.nonzero(remove)[0]
-                        mask[self.m.isin(self.m.array(mask), remove_idx)] = 0
-                        mask[mask > 0] = 1
-                    
-                    # Match working code using a 2x2x2 kernel
-                    dilation_kernel = self.m.ones(shape=(2, 2, 2))
-                    skin = self.m.where(self.ops.binary_dilation(skin == 1, structure=dilation_kernel), 
-                                       self.m.uint8(1), self.m.uint8(0))
-                    
-                    prev[j][skin == 1] = self.m.uint8(self.config['name2label']["body"]["skin"])
-                    
-                    tmp = prev[j].copy()
-                    prev[j][tmp == 0] = self.m.uint8(self.config['name2label']["body"]["bg"])
-                except Exception as e:
-                    print(f"Error processing body for segmentation {j}: {e}")
-                    
-        print("ASSEMBLY COMPLETED")
+                print(f"Warning: Unknown task type '{task}'")
+        except Exception:
+            pass
         return prev
+    
+    def _assemble_total(self, segs, prev):
+        """Assemble results for 'total' task."""
+        for j in range(len(segs)):
+            if j >= len(prev):
+                print(f"Warning: Index {j} out of range for prev array (length {len(prev)})")
+                continue
+                
+            if segs[j] is None or segs[j].size == 0:
+                print(f"Skipping empty segmentation result at index {j}")
+                continue
+            
+            # Process each label group according to total_lmap
+            for i in range(len(self.config['tmap'])):
+                if len(self.config['tmap'][i]) > 0:  # if there are any keys for this value
+                    try:
+                        # Convert to array using appropriate backend (NumPy/CuPy)
+                        a = self.m.where(self.m.isin(self.m.asarray(segs[j], dtype=self.m.uint8), 
+                                                   self.m.array(self.config['tmap'][i])), 
+                                       self.m.uint8(i), self.m.uint8(0))
+                        prev[j] += a
+                    except Exception as e:
+                        print(f"Error processing class {i}: {e}")
+    
+    def _assemble_tissue_types(self, segs, prev):
+        """Assemble results for 'tissue_types' task."""
+        for j in range(len(segs)):
+            if j >= len(prev):
+                print(f"Warning: Index {j} out of range for prev array (length {len(prev)})")
+                continue
+                
+            if segs[j] is None or segs[j].size == 0:
+                print(f"Skipping empty segmentation result at index {j}")
+                continue
+            
+            # Convert to array using appropriate backend
+            t = self.m.asarray(segs[j])
+            
+            # Debugging for TotalSegmentatorFast
+            if hasattr(self, 'segmentation_params') and self.segmentation_params.get('fast', False):
+                print(f"TotalSegmentatorFast tissue_types task: Array shape {t.shape}, unique values: {self.m.unique(t)}")
+            
+            # Labels 1 and 2 both map to fat (label 3)
+            fat_label = self.m.uint8(self.config['name2label']["body"]["fat"])
+            prev[j][t == 1] = fat_label
+            prev[j][t == 2] = fat_label
+            
+            # For TotalSegmentatorFast, check for additional classes that might be mapped differently
+            if hasattr(self, 'segmentation_params') and self.segmentation_params.get('fast', False):
+                if 3 in self.m.unique(t):  # If class 3 exists in the data
+                    prev[j][t == 3] = fat_label  # Also map class 3 to fat
+                    print("Mapped class 3 to fat in TotalSegmentatorFast")
+    
+    def _assemble_body(self, segs, bases, prev):
+        """Assemble results for 'body' task."""
+        for j in range(len(segs)):
+            if j >= len(prev) or j >= len(bases):
+                print(f"Warning: Index {j} out of range for arrays")
+                continue
+                
+            if segs[j] is None or segs[j].size == 0:
+                print(f"Skipping empty segmentation result at index {j}")
+                continue
+            
+            try:
+                # Convert to array using appropriate backend
+                t = self.m.asarray(segs[j])
+                
+                # Debugging for TotalSegmentatorFast
+                if hasattr(self, 'segmentation_params') and self.segmentation_params.get('fast', False):
+                    print(f"TotalSegmentatorFast body task: Array shape {t.shape}, unique values: {self.m.unique(t)}")
+                
+                # Get configuration parameters with defaults
+                iterations_dilation = self.config.get('binary_dilation_iterations', 1)
+                iterations_erosion = self.config.get('binary_erosion_iterations', 3)
+                density_min = self.config.get('density_min', -200)
+                density_max = self.config.get('density_max', 250)
+                blob_size_min = self.config.get('blob_size_min', 10)
+                blob_size_max = self.config.get('blob_size_max', 30)
+                
+                # Values with configurable parameters
+                # For body segmentation, never use fast mode settings regardless of global configuration
+                # Original behavior for standard TotalSegmentator
+                body = self.ops.binary_dilation(t == 1, iterations=iterations_dilation).astype(self.m.uint8)
+                    
+                body_inner = self.ops.binary_erosion(t, iterations=iterations_erosion, 
+                                                   brute_force=True).astype(self.m.uint8)
+                skin = body - body_inner
+                
+                # Use configurable density range
+                density_mask = (bases[j] > density_min) & (bases[j] < density_max)
+                skin[~density_mask] = 0
+                
+                # Process connected components to remove small blobs
+                mask, _ = self.ops.label(skin)
+                counts = self.m.bincount(mask.flatten())
+                
+                # Use configurable blob size parameters
+                if len(counts) > 1:
+                    remove = self.m.where((counts <= blob_size_min) | (counts > blob_size_max), True, False)
+                    remove_idx = self.m.nonzero(remove)[0]
+                    mask[self.m.isin(self.m.array(mask), remove_idx)] = 0
+                    mask[mask > 0] = 1
+                
+                # Match working code using a 2x2x2 kernel
+                dilation_kernel = self.m.ones(shape=(2, 2, 2))
+                skin = self.m.where(self.ops.binary_dilation(skin == 1, structure=dilation_kernel), 
+                                   self.m.uint8(1), self.m.uint8(0))
+                
+                prev[j][skin == 1] = self.m.uint8(self.config['name2label']["body"]["skin"])
+                
+                tmp = prev[j].copy()
+                prev[j][tmp == 0] = self.m.uint8(self.config['name2label']["body"]["bg"])
+            except Exception as e:
+                print(f"Error processing body for segmentation {j}: {e}")
+                import traceback
+                traceback.print_exc()
     
     def name():
         return "TotalSegmentator"
@@ -543,6 +801,12 @@ class PredictorSegmentator(SegmentationMethod):
         Args:
             kwargs: Dictionary containing configuration parameters including:
                 device: The device to use for computation ('cuda' or 'cpu')
+                use_multiprocessing: Whether to use multiprocessing for parallel segmentation
+                num_gpu_workers: Number of GPU worker processes
+                num_cpu_workers: Number of CPU worker processes
+                use_roi: Whether to use region of interest (ROI) feature
+                fast: Whether to use fast mode (3mm resolution)
+                force_cpu: Force CPU usage even if CUDA is available
                 Other configuration parameters
             predictors: Optional dictionary of pre-initialized predictors
         """
@@ -554,6 +818,9 @@ class PredictorSegmentator(SegmentationMethod):
             device_str = kwargs
             kwargs = {'device': device_str}
             
+        # Store the original kwargs for reference
+        self._original_kwargs = kwargs.copy()
+            
         super().__init__(kwargs)
 
         # Extract predictors from kwargs if provided there
@@ -564,6 +831,33 @@ class PredictorSegmentator(SegmentationMethod):
 
         if predictors:
             self.predictor_keys = predictors.keys()
+        
+        # Store any specific configuration settings for this class
+        self.config = getattr(self, 'config', {})
+        for key, value in kwargs.items():
+            self.config[key] = value
+        
+        # Set up multiprocessing
+        self.use_multiprocessing = kwargs.get('use_multiprocessing', True)
+        self.num_gpu_workers = kwargs.get('num_gpu_workers', 1)
+        self.num_cpu_workers = kwargs.get('num_cpu_workers', max(1, os.cpu_count() // 2))
+        
+        # Configurations for segmentation
+        use_roi = self.config.get('use_roi', False)
+        fast_mode = self.config.get('fast', False)
+        
+        # Log configuration
+        if self.use_multiprocessing:
+            print(f"PredictorSegmentator: Multiprocessing enabled with {self.num_gpu_workers} GPU workers "
+                  f"and {self.num_cpu_workers} CPU workers")
+            
+            if use_roi:
+                print(f"*** ROI feature enabled for PredictorSegmentator ***")
+            
+            if fast_mode:
+                print(f"*** FAST mode (3mm) enabled for PredictorSegmentator ***")
+        else:
+            print("PredictorSegmentator: Using standard single-process mode")
     
     def segment(self, 
                 imgs: List[Union[nifti1.Nifti1Image, np.ndarray]],
@@ -581,10 +875,201 @@ class PredictorSegmentator(SegmentationMethod):
         Returns:
             List of segmentation results
         """
-        return self.predictors[task].predict_from_list_of_npy_arrays(
-            imgs, None, properties, None, 2, save_probabilities=False,
-            num_processes_segmentation_export=resamp_thr
-        )
+        # Check if multiprocessing is enabled
+        use_multiprocessing = hasattr(self, 'use_multiprocessing') and self.use_multiprocessing
+        
+        if use_multiprocessing:
+            return self._segment_multiprocessing(imgs, properties, task, resamp_thr)
+        else:
+            # Original behavior - call the predictor directly
+            return self.predictors[task].predict_from_list_of_npy_arrays(
+                imgs, None, properties, None, 2, save_probabilities=False,
+                num_processes_segmentation_export=resamp_thr
+            )
+    
+    def _segment_multiprocessing(self, 
+                               imgs: List[Union[nifti1.Nifti1Image, np.ndarray]],
+                               properties: List[Dict],
+                               task: str,
+                               resamp_thr: int) -> List[np.ndarray]:
+        """
+        Segment the input images using distributed processing across multiple processes.
+        
+        Args:
+            imgs: List of input images to segment
+            properties: List of dictionaries containing image properties
+            task: The segmentation task to perform
+            resamp_thr: Resampling threshold
+            
+        Returns:
+            List of segmentation results
+        """
+        import os
+        import uuid
+        import torch.multiprocessing as mp
+        from queue import Empty
+        
+        # Validate input
+        if not imgs:
+            print("Empty input image list")
+            return []
+        
+        # Initialize results list
+        results = [None] * len(imgs)
+        
+        # Check for configuration parameters
+        use_roi = self.config.get('use_roi', False)
+        fast_mode = self.config.get('fast', False)
+        
+        # Log configuration settings
+        if use_roi:
+            print(f"*** PredictorSegmentator MP: Using ROI feature for {task} segmentation task ***")
+        if fast_mode:
+            print(f"*** PredictorSegmentator MP: Using FAST mode (3mm) for {task} segmentation task ***")
+        
+        # Function for worker processes
+        def worker_process(worker_id, task_queue, result_queue, predictor_key):
+            # Determine device
+            if worker_id == 0 and not self.force_cpu and torch.cuda.is_available():
+                # First worker gets GPU if available
+                device = torch.device("cuda")
+                print(f"Worker {worker_id} using GPU")
+            else:
+                # Other workers use CPU
+                device = torch.device("cpu")
+                print(f"Worker {worker_id} using CPU")
+            
+            # Clone the predictor for this worker
+            if device.type == "cuda" and not self.force_cpu:
+                # For GPU, use the original predictor
+                predictor = self.predictors[predictor_key]
+            else:
+                # For CPU, initialize a new predictor
+                from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+                predictor = nnUNetPredictor(
+                    tile_step_size=0.5,
+                    use_gaussian=True,
+                    use_mirroring=False,
+                    perform_everything_on_device=False,
+                    device="cpu",
+                    verbose=False,
+                    allow_tqdm=True
+                )
+                # Use same model folder as original predictor
+                model_folder = self.predictors[predictor_key].model_folder
+                predictor.initialize_from_trained_model_folder(
+                    model_folder,
+                    use_folds=(0,),
+                    checkpoint_name="checkpoint_final.pth"
+                )
+            
+            # Process tasks from the queue
+            while True:
+                try:
+                    # Get task with timeout
+                    idx, img, props, roi, fast = task_queue.get(timeout=1)
+                    
+                    if idx is None:  # Sentinel value for shutdown
+                        break
+                    
+                    start_time = time.time()
+                    print(f"Worker {worker_id} processing image {idx} on {device}")
+                    
+                    # Configure segmentation parameters
+                    seg_params = {
+                        "save_probabilities": False,
+                        "num_processes_segmentation_export": resamp_thr
+                    }
+                    
+                    # Add ROI parameter if enabled
+                    if roi:
+                        seg_params["roi_subset"] = True
+                        print(f"*** Worker {worker_id} using ROI subset for image {idx} ***")
+                    
+                    # Add fast mode parameter if enabled
+                    if fast:
+                        seg_params["fast"] = True
+                        print(f"*** Worker {worker_id} using FAST mode for image {idx} ***")
+                    
+                    # Process the image
+                    result = predictor.predict_from_list_of_npy_arrays(
+                        [img], None, [props], None, 2, **seg_params
+                    )
+                    
+                    # Send results back
+                    processing_time = time.time() - start_time
+                    result_queue.put((idx, result[0], processing_time))
+                
+                except Empty:
+                    # Queue is empty, just continue waiting
+                    continue
+                except Exception as e:
+                    # Log error and continue
+                    import traceback
+                    print(f"Worker {worker_id} error: {str(e)}")
+                    traceback.print_exc()
+                    # Put a failure result
+                    result_queue.put((idx, None, 0.0))
+        
+        # Create queues for tasks and results
+        task_queue = mp.Queue()
+        result_queue = mp.Queue()
+        
+        # Determine number of workers
+        num_gpu_workers = 1 if not self.force_cpu and torch.cuda.is_available() else 0
+        num_cpu_workers = max(1, os.cpu_count() // 2)  # Use half of available cores
+        total_workers = num_gpu_workers + num_cpu_workers
+        
+        # Start worker processes
+        workers = []
+        for i in range(total_workers):
+            p = mp.Process(
+                target=worker_process,
+                args=(i, task_queue, result_queue, task)
+            )
+            p.daemon = True
+            p.start()
+            workers.append(p)
+        
+        # Submit all tasks to the queue
+        for idx, (img, props) in enumerate(zip(imgs, properties)):
+            task_queue.put((idx, img, props, use_roi, fast_mode))
+        
+        # Add sentinel values to shut down workers
+        for _ in range(total_workers):
+            task_queue.put((None, None, None, None, None))
+        
+        # Collect results
+        completed = 0
+        while completed < len(imgs):
+            try:
+                idx, result, processing_time = result_queue.get(timeout=60)  # 1 minute timeout
+                if idx is not None:
+                    results[idx] = result
+                    completed += 1
+                    print(f"Completed image {idx} in {processing_time:.2f}s, total progress: {completed}/{len(imgs)}")
+            except Empty:
+                print("Warning: No results received within timeout period")
+                break
+        
+        # Wait for all workers to finish
+        for p in workers:
+            p.join(timeout=2)
+            if p.is_alive():
+                p.terminate()
+        
+        # Check for any missing results and create empty arrays if needed
+        for idx in range(len(results)):
+            if results[idx] is None:
+                print(f"No result received for image {idx}, creating empty array")
+                if idx > 0 and results[idx-1] is not None:
+                    # Use same shape as previous result
+                    results[idx] = np.zeros_like(results[idx-1])
+                else:
+                    # Create default shape
+                    results[idx] = np.zeros((256, 256, 256), dtype=np.uint8)
+        
+        return results
     
     def assemble(self,
                 task: str,
@@ -674,6 +1159,23 @@ class PredictorSegmentator(SegmentationMethod):
     
     def tasks(self):
         return self.predictor_keys
+        
+    def cleanup(self):
+        """Clean up resources used by the segmentator."""
+        # This method is called when the segmentator is no longer needed
+        # It ensures proper cleanup of any worker processes or other resources
+        import gc
+        gc.collect()
+        
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+                
+    def __del__(self):
+        """Destructor to ensure proper cleanup."""
+        self.cleanup()
 
 # TODO: Add more config options
 class UltrasoundRenderingMethod(BaseComponent):
@@ -685,6 +1187,7 @@ class UltrasoundRenderingMethod(BaseComponent):
         Args:
             kwargs: Dictionary containing configuration parameters including:
                 device: The device to use for computation ('cuda' or 'cpu')
+                force_cpu: Force CPU usage even if CUDA is available
                 Other configuration parameters
         """
         # Ensure kwargs is a dictionary
@@ -695,7 +1198,10 @@ class UltrasoundRenderingMethod(BaseComponent):
             device_str = kwargs
             kwargs = {'device': device_str}
             
-        super().__init__(kwargs.get('device', torch.device('cpu')))
+        # Extract force_cpu parameter to pass to parent class
+        force_cpu = kwargs.get('force_cpu', False)
+        
+        super().__init__(kwargs.get('device', 'cpu'), force_cpu=force_cpu)
 
         # Morphological operation parameters
         self.config['binary_dilation_iterations'] = kwargs.get('binary_dilation_iterations', 1)
@@ -1170,6 +1676,7 @@ class PointCloudSampler(BaseComponent):
         Args:
             kwargs: Dictionary containing configuration parameters including:
                 device: The device to use for computation ('cuda' or 'cpu')
+                force_cpu: Force CPU usage even if CUDA is available
                 Other configuration parameters
         """
         # Ensure kwargs is a dictionary
@@ -1180,7 +1687,10 @@ class PointCloudSampler(BaseComponent):
             device_str = kwargs
             kwargs = {'device': device_str}
             
-        super().__init__(kwargs.get('device', 'cpu'))
+        # Extract force_cpu parameter to pass to parent class
+        force_cpu = kwargs.get('force_cpu', False)
+        
+        super().__init__(kwargs.get('device', 'cpu'), force_cpu=force_cpu)
         
         # Store labelmap references for dynamic adjustment
         self.stored_labelmaps = []

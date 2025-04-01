@@ -48,24 +48,35 @@ def batched(iterable, n):
 class BaseComponent(ABC):
     """Base class for all pipeline components"""
     
-    def __init__(self, device_str):
+    def __init__(self, device_str, force_cpu=False):
         """
         Initialize the base component.
         
         Args:
-            device: The device to use (CPU or CUDA)
+            device_str: Target compute device ('cpu', 'cuda', or 'gpu')
+                        'gpu' will be converted to 'cuda' for PyTorch compatibility
+            force_cpu: Force CPU usage even if CUDA is available (overrides device_str)
         """        
-        # Set up the appropriate array library and operations based on device
+        # Configuration dictionary for component parameters
         self.config = {}
 
+        # Extract force_cpu from input if it's a dict
+        if isinstance(device_str, dict) and 'force_cpu' in device_str:
+            force_cpu = device_str.get('force_cpu', False)
+            device_str = device_str.get('device', 'cpu')
+            
         # Validate and normalize device string
         if isinstance(device_str, str):
             device_str = device_str.lower()
         
-        # Check CUDA availability
-        cuda_available = torch.cuda.is_available()
+        # Set up device and operations libraries
+        if force_cpu:
+            device_str = 'cpu'
         
-        # Set appropriate array module based on device and CUDA availability
+        # Check CUDA availability
+        cuda_available = torch.cuda.is_available() and not force_cpu
+        
+        # Set operations libraries based on device
         if device_str != 'cpu' and cuda_available:
             try:
                 import cupy as cp
@@ -78,14 +89,9 @@ class BaseComponent(ABC):
         else:
             self.m = np
             self.ops = scipy.ndimage
-            if device_str == 'cuda' and not cuda_available:
-                print("CUDA requested but not available. Using CPU instead.")
 
         # Set PyTorch device
-        if device_str != 'cpu' and cuda_available:
-            self.device = torch.device("cuda", 0)
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device("cuda", 0) if (device_str != 'cpu' and cuda_available) else torch.device("cpu")
 
     @abstractmethod
     def name() -> str:

@@ -22,19 +22,32 @@ class PipelineConfig:
         """Initialize with any kwargs that will become attributes."""
         # Check CUDA availability
         import torch
-        cuda_available = torch.cuda.is_available()
         
-        # Base pipeline settings - properly detect CUDA
-        default_device = 'cuda' if cuda_available else 'cpu'
-        self.device = kwargs.get('device', default_device)
+        # Handle device setting and force_cpu flag
+        force_cpu = kwargs.get('force_cpu', False)
+        cuda_available = torch.cuda.is_available() and not force_cpu
         
-        # If CUDA was requested but isn't available, fall back to CPU
-        if self.device == 'cuda' and not cuda_available:
-            print("CUDA requested but not available. Falling back to CPU.")
+        if force_cpu:
             self.device = 'cpu'
+            self.force_cpu = True
             
-        # Print device being used
-        print(f"Pipeline configured to use device: {self.device}")
+            # Propagate force_cpu flag to component configs
+            for config_name in ['segmentation_config', 'rendering_config', 'pointcloud_config']:
+                if config_name not in kwargs:
+                    kwargs[config_name] = {}
+                kwargs[config_name]['force_cpu'] = True
+        else:
+            default_device = 'cuda' if cuda_available else 'cpu'
+            self.device = kwargs.get('device', default_device)
+            self.force_cpu = False
+            
+            # Fall back to CPU if CUDA unavailable
+            if self.device == 'cuda' and not cuda_available:
+                self.device = 'cpu'
+                
+        # Single log indicating CPU mode when forced
+        if force_cpu and cuda_available:
+            print("Using CPU for all computations")
         
         self.method = kwargs.get('method', 'total')
         self.us_method = kwargs.get('us_method', 'lotus')
@@ -141,6 +154,13 @@ class PipelineConfig:
             
         # Add device and any other kwargs
         merged_kwargs['device'] = self.device
+        
+        # Force CPU takes precedence over all other device settings
+        if hasattr(self, 'force_cpu') and self.force_cpu:
+            merged_kwargs['force_cpu'] = True
+            print(f"[Pipeline] Creating {method_type} component '{method_name}' with force_cpu=True")
+        
+        # Add any remaining kwargs
         merged_kwargs.update(kwargs)
         
         # Components expect a single kwargs dictionary
@@ -331,12 +351,18 @@ class CT2USPipelineFactory:
         pointcloud_method = getattr(config, 'pointcloud_method', 'default')
         pcd_sampler = config.instantiate_method('pointcloud', pointcloud_method)
         
-        # Create and return the pipeline
+        # Get force_cpu flag from config (if present)
+        force_cpu = getattr(config, 'force_cpu', False)
+        
+        # Create and return the pipeline with all parameters
         return CT2USPipeline(
             device_str=config.device,
             segmentation=segmentator,
             us_renderer=us_renderer,
             pcd_sampler=pcd_sampler,
             save_intermediates=config.save_intermediates,
-            intermediate_dir=config.intermediate_dir
+            intermediate_dir=config.intermediate_dir,
+            force_cpu=force_cpu,
+            method=config.method,
+            us_method=config.us_method
         )
