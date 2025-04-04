@@ -76,7 +76,7 @@ class CTDataset(Dataset):
             # that might have been accidentally copied to the img_dir
             filtered_files = [
                 pth for pth in all_files 
-                if not pth.endswith("_label.nii.gz") and not "_processed_" in pth
+                if not "_processed_" in pth
             ]
             
             # Process the paths - maintain unique base names

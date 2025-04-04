@@ -754,9 +754,9 @@ class TotalSegmentator(SegmentationMethod):
     
     def assemble(self,
                 task: str,
-                segs: List[np.ndarray],
-                bases: List[np.ndarray],
-                prev: List[np.ndarray]) -> List[np.ndarray]:
+                segs: list[np.ndarray],
+                bases: list[np.ndarray],
+                prev: list[np.ndarray]) -> list[np.ndarray]:
         """Assemble segmentation results into a unified segmentation map.
         
         Args:
@@ -1442,10 +1442,10 @@ class LotusUltrasoundRenderer(UltrasoundRenderingMethod):
         ])
     
     def render(self, 
-               segs: List[np.ndarray],
+               segs: list[np.ndarray],
                properties: Dict,
-               dest_us: List[str],
-               step_size: int) -> Tuple[List, List, List]:
+               dest_us: list[str],
+               step_size: int) -> tuple[list, list, list]:
         """Render ultrasound images using LOTUS model.
         
         Args:

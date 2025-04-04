@@ -4,10 +4,10 @@ CT2US Pipeline Implementation.
 This module contains the main CT2US pipeline class that orchestrates the segmentation,
 ultrasound rendering, and point cloud generation process.
 """
-
 import os
 import time
 from pathlib import PosixPath as pthlib
+import nibabel
 import tqdm
 from typing import Dict, List, Tuple, Union, Optional, Any
 
@@ -32,7 +32,6 @@ class CT2USPipeline(nn.Module):
     """
     Main pipeline for CT2US that converts CT volumes to simulated ultrasound images.
     """
-    
     def __init__(self, 
                  device_str: str = 'cuda', 
                  segmentation=None,
@@ -78,6 +77,7 @@ class CT2USPipeline(nn.Module):
         
         # Create intermediate directory if needed
         if save_intermediates:
+            import os
             os.makedirs(intermediate_dir, exist_ok=True)
         
         # Setup computational module based on device
@@ -245,34 +245,36 @@ class CT2USPipeline(nn.Module):
             self.pcd_sampler = PointCloudSampler(self.device, config)
             
     
-    def _save_intermediate(self, name: str, data: Union[np.ndarray, torch.Tensor], index: int = 0):
+    def _save(self, name: list[str], data: list[Union[np.ndarray, torch.Tensor]], properties, dir: str = None):
         """Save intermediate result.
-        
-        Args:
-            name: Name of the intermediate result
-            data: Data to save
-            index: Index for multiple results of the same type
         """
-        if not self.save_intermediates:
-            return
+        if dir is None:
+            dir = self.intermediate_dir
+
+            if not self.save_intermediates:
+                return
             
-        # Ensure pipeline directory exists
-        pipeline_dir = os.path.join(self.intermediate_dir, 'pipeline')
-        os.makedirs(pipeline_dir, exist_ok=True)
-        
-        # Convert to numpy if needed
-        if isinstance(data, torch.Tensor):
-            if data.is_cuda:
-                data_np = data.detach().cpu().numpy()
+        for i in range(len(name)):
+            # Convert to numpy if needed
+            d = data[i]
+            n = name[i]
+
+            if isinstance(d, torch.Tensor):
+                if d.is_cuda:
+                    d_np = d.detach().cpu().numpy()
+                else:
+                    d_np = d.detach().numpy()
+            elif isinstance(d, cp.ndarray):
+                d_np = d.get()
             else:
-                data_np = data.detach().numpy()
-        else:
-            data_np = data
-            
-        # Save using numpy
-        file_path = os.path.join(pipeline_dir, f"{name}_{index}.npy")
-        np.save(file_path, data_np)
-    
+                d_np = d
+
+            SimpleITKIO().write_seg(
+                d_np.transpose(2, 1, 0), 
+                n if dir==None else os.path.join(dir, f"{n}.nii.gz"),
+                properties[i]
+            )
+               
     def forward(self,
                 imgs: List[Union[nifti1.Nifti1Image, np.ndarray]],
                 properties: List[Dict],
@@ -307,7 +309,7 @@ class CT2USPipeline(nn.Module):
             'total_time': 0
         }
 
-
+        # TODO: Add preprocessing function to segmentation components and run it here
         
         # Prepare base images and empty label tensors
         # if self.method == 'predictor':
@@ -324,23 +326,22 @@ class CT2USPipeline(nn.Module):
             
         #     # Save intermediate if requested
         #     if self.save_intermediates:
-        #         self._save_intermediate("bases_tensor", bases)
         #         self._save_intermediate("initial_labels_tensor", f_labels)
         # else:
         #     # Regular path with lists
+
+        print(f"Using {self.method} method for segmentation")
+
         bases = [self.m.array(img.dataobj, dtype=self.m.float32) for img in imgs]
         f_labels = [self.m.zeros(bases[idx].shape, dtype=self.m.uint8) for idx in range(len(imgs))]
-        
-        # Save intermediate if requested
-        if self.save_intermediates:
-            for i, base in enumerate(bases):
-                self._save_intermediate(f"base", base, i)
-                self._save_intermediate(f"initial_labels", f_labels[i], i)
     
         # Run segmentation for each task
         segmentation_start = time.time()
         segmentation_results = []
         tasks = self.segmentation.tasks()
+
+        print(tasks)
+
         for idx in tqdm.tqdm(range(len(tasks)), desc="Segmenting"):
             # Only apply fast mode for 'total' task, never for tissue_types or body
             if tasks[idx] != 'total' and hasattr(self.segmentation, 'segmentation_params'):
@@ -352,34 +353,42 @@ class CT2USPipeline(nn.Module):
                     # Force fast mode off for non-total tasks
                     self.segmentation.segmentation_params['fast'] = False
                     print(f"*** Disabling fast mode for '{tasks[idx]}' segmentation regardless of global setting ***")
-                    
-                    # Run segmentation with fast mode disabled
                     result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
                     
                     # Restore original fast setting
                     self.segmentation.segmentation_params['fast'] = original_fast
                 else:
-                    # Fast mode already off, use normal settings
                     result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
             else:
                 # For 'total' task, use whatever settings are configured
                 result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
                 
             segmentation_results.append(result)
+
+        print(segmentation_results)
+
+        if self.save_intermediates and len(segmentation_results) == 3:
+            total, tissue, body = segmentation_results
+            total_n, tissue_n, body_n = [], [], []
+            for idx in range(len(bases)):
+                total_n.append(f"total_{pthlib(dest_label[idx]).name}")
+                tissue_n.append(f"tissue_{pthlib(dest_label[idx]).name}")
+                body_n.append(f"body_{pthlib(dest_label[idx]).name}")
+
+            self._save(total_n, total, properties, self.intermediate_dir)
+            self._save(tissue_n, tissue, properties, self.intermediate_dir)
+            self._save(body_n, body, properties, self.intermediate_dir)
+
+
         timing['segmentation_time'] = time.time() - segmentation_start
         
         # Assemble segmentations into final label maps
         assembly_start = time.time()
         for idx in tqdm.tqdm(range(len(tasks)), desc="Composing into suitable intermediate"):
             f_labels = self.segmentation.assemble(tasks[idx], segmentation_results[idx], bases, f_labels)
-            
-            # Save intermediate assembled labels if requested
-            if self.save_intermediates:
-                if isinstance(f_labels, torch.Tensor):
-                    self._save_intermediate(f"assembled_labels_{tasks[idx]}", f_labels)
-                else:
-                    for i, label in enumerate(f_labels):
-                        self._save_intermediate(f"assembled_labels_{tasks[idx]}", label, i)
+
+        print(f_labels)
+
         timing['assembly_time'] = time.time() - assembly_start
 
         # Generate ultrasound images and warped labels
@@ -460,11 +469,6 @@ class CT2USPipeline(nn.Module):
                 img = Image.fromarray(arr)
                 img.putpalette(self.palettedata * 16)
                 temp.append(img)
-                
-                # Save intermediate viewable image if requested
-                if self.save_intermediates and idx == 0:  # Save only for the first dataset to avoid clutter
-                    img_path = os.path.join(self.intermediate_dir, 'pipeline', f"viewable_label_{slice_idx}.png")
-                    img.save(img_path)
             
             preview_labels.append(temp)
         

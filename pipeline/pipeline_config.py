@@ -22,6 +22,7 @@ class PipelineConfig:
         """Initialize with any kwargs that will become attributes."""
         # Check CUDA availability
         import torch
+        import os
         
         # Handle device setting and force_cpu flag
         force_cpu = kwargs.get('force_cpu', False)
@@ -65,8 +66,8 @@ class PipelineConfig:
         self.pointcloud_config = kwargs.get('pointcloud_config', {})
         
         # Intermediate saving settings
-        self.save_intermediates = kwargs.get('save_intermediates', False)
-        self.intermediate_dir = kwargs.get('intermediate_dir', './intermediates')
+        self.save_intermediates = kwargs.get('save_intermediates', True)
+        self.intermediate_dir = kwargs.get('intermediate_dir', './labels')
         
         # Update any other provided settings
         for key, value in kwargs.items():
@@ -76,6 +77,53 @@ class PipelineConfig:
         
         # Register default methods if component_classes is already imported
         self._register_default_methods()
+
+    def configure(self, **kwargs):
+        import torch
+
+        # Handle device setting and force_cpu flag
+        force_cpu = kwargs.get('force_cpu', False)
+        cuda_available = torch.cuda.is_available() and not force_cpu
+        
+        if force_cpu:
+            self.device = 'cpu'
+            self.force_cpu = True
+            
+            # Propagate force_cpu flag to component configs
+            for config_name in ['segmentation_config', 'rendering_config', 'pointcloud_config']:
+                if config_name not in kwargs:
+                    kwargs[config_name] = {}
+                kwargs[config_name]['force_cpu'] = True
+        else:
+            default_device = 'cuda' if cuda_available else 'cpu'
+            self.device = kwargs.get('device', default_device)
+            self.force_cpu = False
+            
+            # Fall back to CPU if CUDA unavailable
+            if self.device == 'cuda' and not cuda_available:
+                self.device = 'cpu'
+                
+        # Single log indicating CPU mode when forced
+        if force_cpu and cuda_available:
+            print("Using CPU for all computations")
+        
+        self.method = kwargs.get('method', 'total')
+        self.us_method = kwargs.get('us_method', 'lotus')
+        
+        # Component configs
+        self.segmentation_config = kwargs.get('segmentation_config', {})
+        self.rendering_config = kwargs.get('rendering_config', {})
+        self.pointcloud_config = kwargs.get('pointcloud_config', {})
+        
+        # Intermediate saving settings
+        self.save_intermediates = kwargs.get('save_intermediates', True)
+        self.intermediate_dir = kwargs.get('intermediate_dir', './labels')
+        
+        # Update any other provided settings
+        for key, value in kwargs.items():
+            if key not in ['save_intermediates', 'intermediate_dir', 'device', 'method', 'us_method', 
+                          'segmentation_config', 'rendering_config', 'pointcloud_config']:
+                setattr(self, key, value)
     
     def _register_default_methods(self):
         """Register default methods after component_classes is imported."""
@@ -201,9 +249,6 @@ class CT2USPipelineFactory:
         """Initialize the pipeline factory."""
         # Create configuration with proper device detection
         self.config = PipelineConfig(device=self.determine_device())
-        
-        # Register default methods
-        # This is now handled by the PipelineConfig._register_default_methods()
     
     @staticmethod
     def determine_device(device='cuda', gpu_memory_threshold_gb=4):
