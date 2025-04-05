@@ -340,8 +340,6 @@ class CT2USPipeline(nn.Module):
         segmentation_results = []
         tasks = self.segmentation.tasks()
 
-        print(tasks)
-
         for idx in tqdm.tqdm(range(len(tasks)), desc="Segmenting"):
             # Only apply fast mode for 'total' task, never for tissue_types or body
             if tasks[idx] != 'total' and hasattr(self.segmentation, 'segmentation_params'):
@@ -364,8 +362,6 @@ class CT2USPipeline(nn.Module):
                 result = self.segmentation.segment(imgs, properties, tasks[idx], 4)
                 
             segmentation_results.append(result)
-
-        print(segmentation_results)
 
         if self.save_intermediates and len(segmentation_results) == 3:
             total, tissue, body = segmentation_results

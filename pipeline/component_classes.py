@@ -1527,26 +1527,29 @@ class LotusUltrasoundRenderer(UltrasoundRenderingMethod):
                 warped_slice_labels = []
                 for tag in [2, 3, 4, 6, 8, 11, 12, 13]:
                     try:
-                        # Use full morphological operations as in the working code
-                        if self.m == cp:
-                            # Use CuPy operations if available
-                            mask = (a == tag)
-            
-                            closed = self.ops.binary_closing(mask, iterations=3, brute_force=True)
-                            dilated = self.ops.binary_dilation(closed, iterations=2, brute_force=True)
-                            filled = self.ops.binary_fill_holes(dilated)
-            
-                            tag_mask = np.asarray(filled.get())
-                        else:
-                            # Use NumPy/SciPy operations otherwise
-                            mask = (a == tag)
-                            closed = scipy.ndimage.binary_closing(mask, iterations=3)
-                            dilated = scipy.ndimage.binary_dilation(closed, iterations=2)
-                            filled = scipy.ndimage.binary_fill_holes(dilated)
-                            tag_mask = filled
-                        
-                            # Add to warped labels
+                        if self.config['render_interp']:
+                            # Use full morphological operations as in the working code
+                            if self.m == cp:
+                                # Use CuPy operations if available
+                                mask = (a == tag)
+                
+                                closed = self.ops.binary_closing(mask, iterations=3, brute_force=True)
+                                dilated = self.ops.binary_dilation(closed, iterations=2, brute_force=True)
+                                filled = self.ops.binary_fill_holes(dilated)
+                
+                                tag_mask = np.asarray(filled.get())
+                            else:
+                                # Use NumPy/SciPy operations otherwise
+                                mask = (a == tag)
+                                closed = scipy.ndimage.binary_closing(mask, iterations=3)
+                                dilated = scipy.ndimage.binary_dilation(closed, iterations=2)
+                                filled = scipy.ndimage.binary_fill_holes(dilated)
+                                tag_mask = filled
 
+                        else:
+                            # Use simple binary mask without morphological operations
+                            tag_mask = (a == tag).astype(np.uint8)    
+                        
                         warped_slice_labels.append((tag_mask, self.l_dict[tag]))
 
                     except Exception as e:
